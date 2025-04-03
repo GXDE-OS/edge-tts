@@ -1,5 +1,12 @@
-python3-edgetts (6.1.12-1) UNRELEASED; urgency=medium
+python3-edgetts (7.0.0) UNRELEASED; urgency=medium
 
-  * Initial release. (Closes: #nnnn)  <nnnn is the bug number of your ITP>
+  * SubMaker usage has been simplified with .feed() (takes a TTS chunk) and .merge_cues() methods. Example: https://github.com/rany2/edge-tts/blob/7.0/src/edge_tts/util.py#L72-L82
+  * SubMaker now returns subtitles in SRT format. VTT support has been dropped.
+  * Type support for all dicts in the project. This allows a Python IDE, including with VS Code, to provide helpful autocomplete options for TTS chunks or list_voices return output.
+  * Prettier edge-tts CLI output for voice list.
+  * Add support for custom aiohttp connector (#325).
+  * Relicense to LGPLv3 to reduce restrictions on users of this library.
+  * This is the first release that makes use of GitHub releases. There is no changelog for previous versions.
+  * Full Changelog: https://github.com/rany2/edge-tts/commits/7.0.0
 
- -- gfdgd_xi <3025613752@qq.com>  Sat, 24 Aug 2024 08:21:21 +0800
+ -- gfdgd_xi <3025613752@qq.com>  Thu, 03 Apr 2025 22:45:39 +0800
