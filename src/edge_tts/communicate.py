@@ -1,6 +1,5 @@
-"""
-Communicate package.
-"""
+"""Communicate with the service. Only the Communicate class should be used by
+end-users. The other classes and functions are for internal use only."""
 
 import asyncio
 import concurrent.futures
@@ -12,7 +11,6 @@ from contextlib import nullcontext
 from io import TextIOWrapper
 from queue import Queue
 from typing import (
-    Any,
     AsyncGenerator,
     ContextManager,
     Dict,
@@ -27,14 +25,16 @@ from xml.sax.saxutils import escape
 import aiohttp
 import certifi
 
-from .constants import WSS_URL
+from .constants import DEFAULT_VOICE, SEC_MS_GEC_VERSION, WSS_HEADERS, WSS_URL
+from .data_classes import TTSConfig
+from .drm import DRM
 from .exceptions import (
     NoAudioReceived,
     UnexpectedResponse,
     UnknownResponse,
     WebSocketError,
 )
-from .models import TTSConfig
+from .typing import CommunicateState, TTSChunk
 
 
 def get_headers_and_data(
@@ -108,7 +108,7 @@ def split_text_by_byte_length(
     text will be inside of an XML tag.
 
     Args:
-        text (str or bytes): The string to be split.
+        text (str or bytes): The string to be split. If bytes, it must be UTF-8 encoded.
         byte_length (int): The maximum byte length of each string in the list.
 
     Yield:
@@ -165,12 +165,9 @@ def mkssml(tc: TTSConfig, escaped_text: Union[str, bytes]) -> str:
     Returns:
         str: The SSML string.
     """
-
-    # If the text is bytes, convert it to a string.
     if isinstance(escaped_text, bytes):
         escaped_text = escaped_text.decode("utf-8")
 
-    # Return the SSML string.
     return (
         "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>"
         f"<voice name='{tc.voice}'>"
@@ -237,28 +234,22 @@ def calc_max_mesg_size(tts_config: TTSConfig) -> int:
 
 class Communicate:
     """
-    Class for communicating with the service.
+    Communicate with the service.
     """
 
     def __init__(
         self,
         text: str,
-        voice: str = "Microsoft Server Speech Text to Speech Voice (en-US, AriaNeural)",
+        voice: str = DEFAULT_VOICE,
         *,
         rate: str = "+0%",
         volume: str = "+0%",
         pitch: str = "+0Hz",
+        connector: Optional[aiohttp.BaseConnector] = None,
         proxy: Optional[str] = None,
-        connect_timeout: int = 10,
-        receive_timeout: int = 60,
+        connect_timeout: Optional[int] = 10,
+        receive_timeout: Optional[int] = 60,
     ):
-        """
-        Initializes the Communicate class.
-
-        Raises:
-            ValueError: If the voice is not valid.
-        """
-
         # Validate TTS settings and store the TTSConfig object.
         self.tts_config = TTSConfig(voice, rate, volume, pitch)
 
@@ -289,15 +280,20 @@ class Communicate:
             sock_read=receive_timeout,
         )
 
+        # Validate the connector parameter.
+        if connector is not None and not isinstance(connector, aiohttp.BaseConnector):
+            raise TypeError("connector must be aiohttp.BaseConnector")
+        self.connector: Optional[aiohttp.BaseConnector] = connector
+
         # Store current state of TTS.
-        self.state: Dict[str, Any] = {
-            "partial_text": None,
+        self.state: CommunicateState = {
+            "partial_text": b"",
             "offset_compensation": 0,
             "last_duration_offset": 0,
             "stream_was_called": False,
         }
 
-    def __parse_metadata(self, data: bytes) -> Dict[str, Any]:
+    def __parse_metadata(self, data: bytes) -> TTSChunk:
         for meta_obj in json.loads(data)["Metadata"]:
             meta_type = meta_obj["Type"]
             if meta_type == "WordBoundary":
@@ -316,34 +312,21 @@ class Communicate:
             raise UnknownResponse(f"Unknown metadata type: {meta_type}")
         raise UnexpectedResponse("No WordBoundary metadata found")
 
-    async def __stream(self) -> AsyncGenerator[Dict[str, Any], None]:
+    async def __stream(self) -> AsyncGenerator[TTSChunk, None]:
         async def send_command_request() -> None:
-            """Sends the request to the service."""
-
-            # Prepare the request to be sent to the service.
-            #
-            # Note sentenceBoundaryEnabled and wordBoundaryEnabled are actually supposed
-            # to be booleans, but Edge Browser seems to send them as strings.
-            #
-            # This is a bug in Edge as Azure Cognitive Services actually sends them as
-            # bool and not string. For now I will send them as bool unless it causes
-            # any problems.
-            #
-            # Also pay close attention to double { } in request (escape for f-string).
+            """Sends the command request to the service."""
             await websocket.send_str(
                 f"X-Timestamp:{date_to_string()}\r\n"
                 "Content-Type:application/json; charset=utf-8\r\n"
                 "Path:speech.config\r\n\r\n"
                 '{"context":{"synthesis":{"audio":{"metadataoptions":{'
-                '"sentenceBoundaryEnabled":false,"wordBoundaryEnabled":true},'
+                '"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"true"},'
                 '"outputFormat":"audio-24khz-48kbitrate-mono-mp3"'
                 "}}}}\r\n"
             )
 
         async def send_ssml_request() -> None:
             """Sends the SSML request to the service."""
-
-            # Send the request to the service.
             await websocket.send_str(
                 ssml_headers_plus_data(
                     connect_id(),
@@ -363,27 +346,20 @@ class Communicate:
         # Create a new connection to the service.
         ssl_ctx = ssl.create_default_context(cafile=certifi.where())
         async with aiohttp.ClientSession(
+            connector=self.connector,
             trust_env=True,
             timeout=self.session_timeout,
         ) as session, session.ws_connect(
-            f"{WSS_URL}&ConnectionId={connect_id()}",
+            f"{WSS_URL}&Sec-MS-GEC={DRM.generate_sec_ms_gec()}"
+            f"&Sec-MS-GEC-Version={SEC_MS_GEC_VERSION}"
+            f"&ConnectionId={connect_id()}",
             compress=15,
             proxy=self.proxy,
-            headers={
-                "Pragma": "no-cache",
-                "Cache-Control": "no-cache",
-                "Origin": "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Accept-Language": "en-US,en;q=0.9",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                " (KHTML, like Gecko) Chrome/91.0.4472.77 Safari/537.36 Edg/91.0.864.41",
-            },
+            headers=WSS_HEADERS,
             ssl=ssl_ctx,
         ) as websocket:
-            # Send the request to the service.
             await send_command_request()
 
-            # Send the SSML request to the service.
             await send_ssml_request()
 
             async for received in websocket:
@@ -485,7 +461,7 @@ class Communicate:
 
     async def stream(
         self,
-    ) -> AsyncGenerator[Dict[str, Any], None]:
+    ) -> AsyncGenerator[TTSChunk, None]:
         """
         Streams audio and metadata from the service.
 
@@ -503,8 +479,16 @@ class Communicate:
 
         # Stream the audio and metadata from the service.
         for self.state["partial_text"] in self.texts:
-            async for message in self.__stream():
-                yield message
+            try:
+                async for message in self.__stream():
+                    yield message
+            except aiohttp.ClientResponseError as e:
+                if e.status != 403:
+                    raise
+
+                DRM.handle_client_response_error(e)
+                async for message in self.__stream():
+                    yield message
 
     async def save(
         self,
@@ -530,7 +514,7 @@ class Communicate:
                     json.dump(message, metadata)
                     metadata.write("\n")
 
-    def stream_sync(self) -> Generator[Dict[str, Any], None, None]:
+    def stream_sync(self) -> Generator[TTSChunk, None, None]:
         """Synchronous interface for async stream method"""
 
         def fetch_async_items(queue: Queue) -> None:  # type: ignore

@@ -1,39 +1,35 @@
-"""
-Main package.
-"""
+"""Utility functions for the command line interface. Used by the main module."""
 
 import argparse
 import asyncio
 import sys
-from io import TextIOWrapper
-from typing import Any, TextIO, Union
+from typing import Optional, TextIO
+
+from tabulate import tabulate
 
 from . import Communicate, SubMaker, list_voices
+from .constants import DEFAULT_VOICE
+from .data_classes import UtilArgs
 
 
-async def _print_voices(*, proxy: str) -> None:
+async def _print_voices(*, proxy: Optional[str]) -> None:
     """Print all available voices."""
     voices = await list_voices(proxy=proxy)
     voices = sorted(voices, key=lambda voice: voice["ShortName"])
-    for idx, voice in enumerate(voices):
-        if idx != 0:
-            print()
-
-        for key in voice.keys():
-            if key in (
-                "SuggestedCodec",
-                "FriendlyName",
-                "Status",
-                "VoiceTag",
-                "Name",
-                "Locale",
-            ):
-                continue
-            pretty_key_name = key if key != "ShortName" else "Name"
-            print(f"{pretty_key_name}: {voice[key]}")
+    headers = ["Name", "Gender", "ContentCategories", "VoicePersonalities"]
+    table = [
+        [
+            voice["ShortName"],
+            voice["Gender"],
+            ", ".join(voice["VoiceTag"]["ContentCategories"]),
+            ", ".join(voice["VoiceTag"]["VoicePersonalities"]),
+        ]
+        for voice in voices
+    ]
+    print(tabulate(table, headers))
 
 
-async def _run_tts(args: Any) -> None:
+async def _run_tts(args: UtilArgs) -> None:
     """Run TTS after parsing arguments from command line."""
 
     try:
@@ -50,44 +46,60 @@ async def _run_tts(args: Any) -> None:
         print("\nOperation canceled.", file=sys.stderr)
         return
 
-    tts: Communicate = Communicate(
+    communicate = Communicate(
         args.text,
         args.voice,
-        proxy=args.proxy,
         rate=args.rate,
         volume=args.volume,
         pitch=args.pitch,
+        proxy=args.proxy,
     )
-    subs: SubMaker = SubMaker()
-    with (
-        open(args.write_media, "wb") if args.write_media else sys.stdout.buffer
-    ) as audio_file:
-        async for chunk in tts.stream():
+    submaker = SubMaker()
+    try:
+        audio_file = (
+            open(args.write_media, "wb")
+            if args.write_media is not None and args.write_media != "-"
+            else sys.stdout.buffer
+        )
+        sub_file: Optional[TextIO] = (
+            open(args.write_subtitles, "w", encoding="utf-8")
+            if args.write_subtitles is not None and args.write_subtitles != "-"
+            else None
+        )
+        if sub_file is None and args.write_subtitles == "-":
+            sub_file = sys.stderr
+
+        async for chunk in communicate.stream():
             if chunk["type"] == "audio":
                 audio_file.write(chunk["data"])
             elif chunk["type"] == "WordBoundary":
-                subs.create_sub((chunk["offset"], chunk["duration"]), chunk["text"])
+                submaker.feed(chunk)
 
-    sub_file: Union[TextIOWrapper, TextIO] = (
-        open(args.write_subtitles, "w", encoding="utf-8")
-        if args.write_subtitles
-        else sys.stderr
-    )
-    with sub_file:
-        sub_file.write(subs.generate_subs(args.words_in_cue))
+        if args.words_in_cue > 0:
+            submaker.merge_cues(args.words_in_cue)
+
+        if sub_file is not None:
+            sub_file.write(submaker.get_srt())
+    finally:
+        if audio_file is not sys.stdout.buffer:
+            audio_file.close()
+        if sub_file is not None and sub_file is not sys.stderr:
+            sub_file.close()
 
 
 async def amain() -> None:
     """Async main function"""
-    parser = argparse.ArgumentParser(description="Microsoft Edge TTS")
+    parser = argparse.ArgumentParser(
+        description="Text-to-speech using Microsoft Edge's online TTS service."
+    )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("-t", "--text", help="what TTS will say")
     group.add_argument("-f", "--file", help="same as --text but read from file")
     parser.add_argument(
         "-v",
         "--voice",
-        help="voice for TTS. Default: en-US-AriaNeural",
-        default="en-US-AriaNeural",
+        help=f"voice for TTS. Default: {DEFAULT_VOICE}",
+        default=DEFAULT_VOICE,
     )
     group.add_argument(
         "-l",
@@ -102,7 +114,7 @@ async def amain() -> None:
         "--words-in-cue",
         help="number of words in a subtitle cue. Default: 10.",
         default=10,
-        type=float,
+        type=int,
     )
     parser.add_argument(
         "--write-media", help="send media output to file instead of stdout"
@@ -112,16 +124,14 @@ async def amain() -> None:
         help="send subtitle output to provided file instead of stderr",
     )
     parser.add_argument("--proxy", help="use a proxy for TTS and voice list.")
-    args = parser.parse_args()
+    args = parser.parse_args(namespace=UtilArgs())
 
     if args.list_voices:
         await _print_voices(proxy=args.proxy)
         sys.exit(0)
 
     if args.file is not None:
-        # we need to use sys.stdin.read() because some devices
-        # like Windows and Termux don't have a /dev/stdin.
-        if args.file == "/dev/stdin":
+        if args.file in ("-", "/dev/stdin"):
             args.text = sys.stdin.read()
         else:
             with open(args.file, "r", encoding="utf-8") as file:

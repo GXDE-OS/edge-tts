@@ -1,5 +1,8 @@
-"""Models for the Edge TTS module."""
+"""Data models for edge-tts."""
 
+# pylint: disable=too-few-public-methods
+
+import argparse
 import re
 from dataclasses import dataclass
 
@@ -7,7 +10,7 @@ from dataclasses import dataclass
 @dataclass
 class TTSConfig:
     """
-    Represents the internal TTS configuration for Edge TTS's communicate class.
+    Represents the internal TTS configuration for edge-tts's Communicate class.
     """
 
     voice: str
@@ -68,3 +71,19 @@ class TTSConfig:
         self.validate_string_param("rate", self.rate, r"^[+-]\d+%$")
         self.validate_string_param("volume", self.volume, r"^[+-]\d+%$")
         self.validate_string_param("pitch", self.pitch, r"^[+-]\d+Hz$")
+
+
+class UtilArgs(argparse.Namespace):
+    """CLI arguments."""
+
+    text: str
+    file: str
+    voice: str
+    list_voices: bool
+    rate: str
+    volume: str
+    pitch: str
+    words_in_cue: int
+    write_media: str
+    write_subtitles: str
+    proxy: str
